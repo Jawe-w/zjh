@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>炸金花 - P2P免部署联机版</title>
+    <!-- 引入 React, Tailwind, PeerJS -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        .poker-card { transition: all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); perspective: 1000px; }
+        .felt-gradient { background: radial-gradient(circle at center, #065f46 0%, #064e3b 100%); }
+        @keyframes pulse-border {
+            0%, 100% { border-color: rgba(245, 158, 11, 0.3); }
+            50% { border-color: rgba(245, 158, 11, 1); }
+        }
+        .active-turn { animation: pulse-border 2s infinite; }
+        .loading-spinner { border: 3px solid rgba(255,255,255,0.1); border-top: 3px solid #f59e0b; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-slate-950 text-white overflow-hidden">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- 扑克逻辑 ---
+        const SUITS = ['♠', '♥', '♣', '♦'];
+        const VALUES = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
+        const VALUE_MAP = { '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, '10': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14 };
+
+        const evaluateHand = (cards) => {
+            if (!cards || cards.length !== 3) return { type: 0, score: 0, name: '未知' };
+            const v = cards.map(c => VALUE_MAP[c.value]).sort((a, b) => b - a);
+            const s = cards.map(c => c.suit);
+            const isFlush = s[0] === s[1] && s[1] === s[2];
+            const isStraight = (v[0] - v[1] === 1 && v[1] - v[2] === 1) || (v[0] === 14 && v[1] === 3 && v[2] === 2);
+            const isTrail = v[0] === v[1] && v[1] === v[2];
+            const isPair = v[0] === v[1] || v[1] === v[2] || v[0] === v[2];
+            let type = 1, typeName = '单张', baseScore = v[0] * 10000 + v[1] * 100 + v[2];
+            if (isTrail) { type = 6; typeName = '豹子'; baseScore = v[0]; }
+            else if (isFlush && isStraight) { type = 5; typeName = '顺金'; baseScore = v[0]; }
+            else if (isFlush) { type = 4; typeName = '金花'; }
+            else if (isStraight) { type = 3; typeName = '顺子'; baseScore = v[0]; }
+            else if (isPair) { 
+                type = 2; typeName = '对子'; 
+                const pairVal = v[0] === v[1] ? v[0] : (v[1] === v[2] ? v[1] : v[0]);
+                const kicker = v[0] === v[1] ? v[2] : (v[1] === v[2] ? v[0] : v[1]);
+                baseScore = pairVal * 100 + kicker;
+            }
+            return { type, score: type * 1000000 + baseScore, name: typeName };
+        };
+
+        const createDeck = () => {
+            let deck = [];
+            for (let suit of SUITS) { for (let value of VALUES) { deck.push({ suit, value }); } }
+            return deck.sort(() => Math.random() - 0.5);
+        };
+
+        // --- 主程序 ---
+        function App() {
+            const [myPeer, setMyPeer] = useState(null);
+            const [myId, setMyId] = useState('');
+            const [isHost, setIsHost] = useState(false);
+            const [username, setUsername] = useState(localStorage.getItem('zjh_p2p_name') || '');
+            const [roomState, setRoomState] = useState({
+                players: [], 
+                status: 'waiting', 
+                pot: 0,
+                currentBet: 10,
+                turnIndex: 0,
+                lastAction: '等待玩家加入...'
+            });
+            const [isJoined, setIsJoined] = useState(false);
+            const [isConnecting, setIsConnecting] = useState(false);
+            const [targetRoomId, setTargetRoomId] = useState('');
+            const [showJoinModal, setShowJoinModal] = useState(false);
+            const connsRef = useRef([]);
+
+            // 1. 初始化 Peer
+            useEffect(() => {
+                const urlParams = new URLSearchParams(window.location.search);
+                const joinId = urlParams.get('room');
+
+                const peer = new Peer();
+                peer.on('open', (id) => {
+                    console.log('My peer ID is: ' + id);
+                    setMyId(id);
+                    setMyPeer(peer);
+                    if (joinId) {
+                        setIsConnecting(true);
+                        joinRoom(joinId, peer);
+                    }
+                });
+
+                peer.on('error', (err) => {
+                    console.error('Peer error:', err.type);
+                    setIsConnecting(false);
+                    if (err.type === 'peer-not-found') alert('找不到该房间 ID，请确认 ID 是否正确且房主在线。');
+                    else alert('连接出错: ' + err.type);
+                });
+
+                peer.on('connection', (conn) => {
+                    console.log('Incoming connection from: ' + conn.peer);
+                    conn.on('open', () => {
+                        conn.on('data', (data) => {
+                            if (data.type === 'JOIN') {
+                                handlePlayerJoin(conn, data.name);
+                            } else if (data.type === 'ACTION') {
+                                processAction(data.action, conn.peer);
+                            }
+                        });
+                    });
+                });
+
+                return () => peer.destroy();
+            }, []);
+
+            // --- 逻辑处理 ---
+            const handlePlayerJoin = (conn, name) => {
+                setRoomState(prev => {
+                    const exists = prev.players.find(p => p.id === conn.peer);
+                    if (exists) return prev;
+                    
+                    const newState = {
+                        ...prev,
+                        players: [...prev.players, { id: conn.peer, name, chips: 1000, cards: [], isFolded: false, isHost: false }],
+                        lastAction: `${name} 加入了房间`
+                    };
+                    connsRef.current.push(conn);
+                    broadcast(newState);
+                    return newState;
+                });
+            };
+
+            const broadcast = (state) => {
+                connsRef.current.forEach(c => {
+                    if (c.open) c.send({ type: 'UPDATE', state });
+                });
+            };
+
+            const processAction = (action, peerId) => {
+                setRoomState(prev => {
+                    let updated = [...prev.players];
+                    let pot = prev.pot;
+                    let lastAction = '';
+                    const idx = prev.turnIndex;
+                    const p = updated[idx];
+
+                    if (action === 'FOLD') {
+                        p.isFolded = true;
+                        lastAction = `${p.name} 弃牌了`;
+                    } else if (action === 'CALL') {
+                        p.chips -= prev.currentBet;
+                        pot += prev.currentBet;
+                        lastAction = `${p.name} 跟注了`;
+                    }
+
+                    // 寻找下一个未弃牌玩家
+                    let next = (idx + 1) % updated.length;
+                    let findCount = 0;
+                    while(updated[next].isFolded && findCount < updated.length) {
+                        next = (next + 1) % updated.length;
+                        findCount++;
+                    }
+
+                    // 检查胜负
+                    const activePlayers = updated.filter(p => !p.isFolded);
+                    let status = prev.status;
+                    if (activePlayers.length === 1) {
+                        status = 'showdown';
+                        activePlayers[0].chips += pot;
+                        lastAction = `局结束，${activePlayers[0].name} 获胜！`;
+                    }
+
+                    const newState = { ...prev, status, players: updated, pot, turnIndex: next, lastAction };
+                    broadcast(newState);
+                    return newState;
+                });
+            };
+
+            const startGame = () => {
+                const deck = createDeck();
+                const updated = roomState.players.map(p => ({
+                    ...p, cards: [deck.pop(), deck.pop(), deck.pop()], isFolded: false, chips: p.chips - 10
+                }));
+                const newState = {
+                    ...roomState, status: 'playing', players: updated, pot: updated.length * 10, turnIndex: 0, lastAction: '游戏开始，底注已扣除'
+                };
+                setRoomState(newState);
+                broadcast(newState);
+            };
+
+            const createRoom = () => {
+                if (!username) return alert('请输入昵称');
+                setIsHost(true);
+                setIsJoined(true);
+                setRoomState(prev => ({
+                    ...prev,
+                    players: [{ id: myId, name: username, chips: 1000, cards: [], isFolded: false, isHost: true }]
+                }));
+                localStorage.setItem('zjh_p2p_name', username);
+            };
+
+            const joinRoom = (id, peerInstance = myPeer) => {
+                if (!id) return alert('请输入房间 ID');
+                setIsConnecting(true);
+                console.log('Attempting to connect to: ' + id);
+                
+                const conn = peerInstance.connect(id, { label: 'ZJH_CONN', reliable: true });
+                
+                conn.on('open', () => {
+                    console.log('Connection opened with host: ' + id);
+                    conn.send({ type: 'JOIN', name: username || localStorage.getItem('zjh_p2p_name') || '匿名玩家' });
+                    setIsJoined(true);
+                    setIsConnecting(false);
+                    setShowJoinModal(false);
+                    connsRef.current = [conn];
+                });
+
+                conn.on('data', (data) => {
+                    if (data.type === 'UPDATE') {
+                        setRoomState(data.state);
+                    }
+                });
+
+                conn.on('close', () => {
+                    alert('房主已断开连接');
+                    window.location.reload();
+                });
+
+                // 设置超时
+                setTimeout(() => {
+                    if (!isJoined && isConnecting) {
+                        setIsConnecting(false);
+                        alert('连接超时，请检查网络或确认房主 ID 是否正确。');
+                    }
+                }, 10000);
+            };
+
+            const copyInfo = () => {
+                const isLocal = window.location.protocol === 'file:';
+                if (isLocal) {
+                    navigator.clipboard.writeText(myId);
+                    alert('已复制 Room ID：' + myId + '\n请发送给好友。');
+                } else {
+                    const url = `${window.location.origin}${window.location.pathname}?room=${myId}`;
+                    navigator.clipboard.writeText(url);
+                    alert('邀请链接已复制！');
+                }
+            };
+
+            const handleClientAction = (action) => {
+                if (isHost) {
+                    processAction(action, myId);
+                } else {
+                    connsRef.current[0].send({ type: 'ACTION', action });
+                }
+            };
+
+            if (!isJoined) {
+                return (
+                    <div className="flex flex-col items-center justify-center min-h-screen p-6">
+                        <div className="bg-slate-900 p-10 rounded-[2.5rem] border border-white/10 shadow-2xl w-full max-w-sm">
+                            <h1 className="text-4xl font-black text-amber-500 mb-8 text-center italic tracking-tighter">ZHA JIN HUA</h1>
+                            <input 
+                                className="w-full bg-black/40 border border-white/10 p-4 rounded-2xl mb-6 outline-none focus:ring-2 focus:ring-amber-500" 
+                                placeholder="输入你的昵称" 
+                                value={username} 
+                                onChange={e => setUsername(e.target.value)} 
+                            />
+                            <div className="space-y-3">
+                                <button 
+                                    className="w-full bg-amber-600 hover:bg-amber-500 p-4 rounded-2xl font-black transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50" 
+                                    onClick={createRoom}
+                                    disabled={!myId || isConnecting}
+                                >
+                                    {!myId ? '服务初始化中...' : '创建房间'}
+                                </button>
+                                <button 
+                                    className="w-full bg-slate-800 hover:bg-slate-700 p-4 rounded-2xl font-black transition-all disabled:opacity-50" 
+                                    onClick={() => setShowJoinModal(true)}
+                                    disabled={!myId || isConnecting}
+                                >
+                                    输入 ID 加入好友
+                                </button>
+                            </div>
+                        </div>
+
+                        {showJoinModal && (
+                            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6 z-50">
+                                <div className="bg-slate-900 p-8 rounded-3xl border border-white/10 w-full max-w-sm">
+                                    <h2 className="text-xl font-bold mb-4 text-amber-500">加入房间</h2>
+                                    <input 
+                                        className="w-full bg-black/40 border border-white/10 p-4 rounded-xl mb-4 outline-none font-mono text-sm" 
+                                        placeholder="粘贴好友的 Room ID" 
+                                        value={targetRoomId} 
+                                        onChange={e => setTargetRoomId(e.target.value)} 
+                                    />
+                                    <div className="flex gap-2">
+                                        <button 
+                                            className="flex-1 bg-amber-600 p-3 rounded-xl font-bold flex items-center justify-center gap-2" 
+                                            onClick={() => joinRoom(targetRoomId)}
+                                            disabled={isConnecting}
+                                        >
+                                            {isConnecting ? <div className="loading-spinner"></div> : '确认加入'}
+                                        </button>
+                                        <button className="flex-1 bg-slate-700 p-3 rounded-xl font-bold" onClick={() => setShowJoinModal(false)}>取消</button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                        {isConnecting && !showJoinModal && (
+                            <div className="mt-4 flex items-center gap-2 text-amber-500 font-bold">
+                                <div className="loading-spinner"></div> 连接中...
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            const me = roomState.players.find(p => p.id === myId);
+
+            return (
+                <div className="flex flex-col h-screen felt-gradient">
+                    <header className="p-4 bg-black/40 backdrop-blur-md flex justify-between items-center border-b border-white/5">
+                        <div className="flex items-center gap-4">
+                            <span className="text-xs font-bold bg-amber-500 text-black px-3 py-1 rounded-full uppercase tracking-tighter">P2P 联机</span>
+                            <div className="text-slate-400 text-[10px] font-mono leading-none">
+                                我的 ID: {myId.slice(0,8)}...
+                                <div className="text-emerald-500 mt-0.5 font-bold uppercase">Online: {roomState.players.length}</div>
+                            </div>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={copyInfo} className="bg-white/10 hover:bg-white/20 px-4 py-1.5 rounded-xl text-xs font-bold transition-colors">
+                                🔗 邀请/房号
+                            </button>
+                            <button onClick={() => window.location.reload()} className="text-slate-500 hover:text-red-500 px-2">
+                                <svg size={18} fill="none" viewBox="0 0 24 24" stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                            </button>
+                        </div>
+                    </header>
+
+                    <main className="flex-grow relative overflow-hidden">
+                        {/* 牌桌中心奖励展示 */}
+                        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center">
+                            <div className="bg-black/20 backdrop-blur-3xl p-10 rounded-[4rem] border border-white/5 shadow-[inset_0_0_50px_rgba(0,0,0,0.5)]">
+                                <div className="text-amber-500 text-6xl font-black italic tracking-tighter shadow-amber-500/20 drop-shadow-xl">💰 {roomState.pot}</div>
+                                <div className="text-[10px] text-slate-400 uppercase tracking-widest mt-2 font-black opacity-60">Total Prize Pool</div>
+                            </div>
+                        </div>
+
+                        {/* 渲染所有玩家 */}
+                        {roomState.players.map((p, i) => {
+                            const angle = (i * 2 * Math.PI) / roomState.players.length;
+                            const x = 50 + 38 * Math.cos(angle - Math.PI/2);
+                            const y = 50 + 38 * Math.sin(angle - Math.PI/2);
+                            const isMe = p.id === myId;
+                            const isTurn = roomState.turnIndex === i && roomState.status === 'playing';
+
+                            return (
+                                <div key={p.id} className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center z-10" style={{ left: `${x}%`, top: `${y}%` }}>
+                                    <div className="flex -space-x-5 mb-3">
+                                        {(p.cards.length > 0 ? p.cards : [{v: '?', s: '?'}, {v: '?', s: '?'}, {v: '?', s: '?'}]).map((c, ci) => (
+                                            <div key={ci} className={`w-12 h-16 md:w-16 md:h-22 bg-white rounded-xl border-2 shadow-2xl flex flex-col items-center justify-center poker-card ${isMe || roomState.status === 'showdown' ? 'scale-110' : 'bg-slate-800 border-slate-700'}`}>
+                                                {(p.cards.length > 0 && (isMe || roomState.status === 'showdown')) ? (
+                                                    <div className={`font-black text-xl text-center leading-none ${c.suit === '♥' || c.suit === '♦' ? 'text-red-500' : 'text-slate-900'}`}>
+                                                        {c.value}
+                                                        <span className="text-xs block mt-1">{c.suit}</span>
+                                                    </div>
+                                                ) : <div className="w-full h-full bg-slate-800 rounded-lg border-2 border-slate-700 flex items-center justify-center"><div className="w-full h-full bg-[repeating-linear-gradient(45deg,transparent,transparent_5px,rgba(255,255,255,0.05)_5px,rgba(255,255,255,0.05)_10px)] opacity-50"></div></div>}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className={`px-5 py-2.5 rounded-2xl border-2 transition-all min-w-[110px] text-center ${isTurn ? 'active-turn bg-amber-500/20 scale-125 shadow-lg shadow-amber-500/20 z-20' : 'border-white/10 bg-black/60 backdrop-blur-md'}`}>
+                                        <div className="text-xs font-black truncate max-w-[90px]">{p.name} {isMe && '⭐'}</div>
+                                        <div className="text-[10px] text-emerald-400 font-bold tracking-tight">💰 {p.chips}</div>
+                                        {p.isFolded && <div className="text-[9px] text-red-500 font-black uppercase mt-1">Folded</div>}
+                                        {roomState.status === 'showdown' && p.cards.length > 0 && !p.isFolded && (
+                                            <div className="text-[8px] text-amber-500 font-bold mt-1 bg-black/40 rounded px-1">{evaluateHand(p.cards).name}</div>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </main>
+
+                    {/* 操作栏 */}
+                    <footer className="p-8 bg-slate-950/90 backdrop-blur-2xl border-t border-white/10 shadow-[0_-10px_50px_rgba(0,0,0,0.5)]">
+                        <div className="max-w-2xl mx-auto">
+                            <div className="text-center text-slate-500 text-[10px] font-black uppercase tracking-[0.3em] mb-6 animate-pulse">
+                                {roomState.lastAction}
+                            </div>
+                            
+                            <div className="flex justify-center">
+                                {roomState.status === 'waiting' || roomState.status === 'showdown' ? (
+                                    isHost ? (
+                                        <button className="bg-amber-600 hover:bg-amber-500 px-20 py-5 rounded-2xl font-black text-xl shadow-2xl shadow-amber-900/40 active:scale-95 transition-all" onClick={startGame}>
+                                            {roomState.status === 'showdown' ? '再来一局' : '开始发牌 (GO)'}
+                                        </button>
+                                    ) : (
+                                        <div className="text-slate-400 font-bold bg-white/5 px-10 py-4 rounded-2xl border border-white/5 text-sm uppercase tracking-widest">Waiting for host...</div>
+                                    )
+                                ) : (
+                                    <div className={`flex gap-4 w-full transition-all ${roomState.players[roomState.turnIndex]?.id !== myId ? 'opacity-20 pointer-events-none grayscale blur-[1px]' : ''}`}>
+                                        <button className="flex-1 bg-red-900/20 border border-red-500/50 text-red-500 py-5 rounded-2xl font-black hover:bg-red-900/40 active:scale-95 transition-all uppercase" onClick={() => handleClientAction('FOLD')}>弃牌 FOLD</button>
+                                        <button className="flex-1 bg-amber-600 text-slate-950 py-5 rounded-2xl font-black text-xl hover:bg-amber-500 shadow-xl shadow-amber-600/20 active:scale-95 transition-all uppercase" onClick={() => handleClientAction('CALL')}>跟注 CALL</button>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </footer>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
